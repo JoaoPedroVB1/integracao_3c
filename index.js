@@ -12,13 +12,18 @@ const TOKEN_3C = process.env.TOKEN_3C;
 const INTERVALO_BUSCA = 60000; 
 const chamadasProcessadas = new Set();
 
+// --- NOVIDADE: CACHE ANTI-DUPLICIDADE ---
+// Guarda os IDs criados nesta sessão para evitar criar duplicado 
+// enquanto o HubSpot ainda está indexando.
+const cacheIdsRecentes = new Map(); // Chave: Telefone -> Valor: ContactId
+
 // Ignora erro SSL
 const agent = new https.Agent({  
   rejectUnauthorized: false
 });
 
 console.log('------------------------------------------------');
-console.log('🤖 ROBÔ 3C RODANDO (Polling V6 - Final)');
+console.log('🤖 ROBÔ 3C RODANDO (Polling V7 - Anti-Duplicidade)');
 console.log(`🕒 Verificando a cada ${INTERVALO_BUSCA / 1000} segundos...`);
 console.log('------------------------------------------------');
 
@@ -89,9 +94,6 @@ async function buscarNovasChamadas() {
             for (const call of novasChamadas) {
                 const id = call.id || call._id;
                 chamadasProcessadas.add(id);
-
-                // Agora passamos TODAS as chamadas para a função,
-                // lá dentro decidimos se atualiza tudo ou só o campo de "sem sucesso".
                 await enviarParaHubspot(call);
             }
         } 
@@ -104,7 +106,7 @@ async function buscarNovasChamadas() {
 async function enviarParaHubspot(callData) {
     const callId = callData.id || callData._id;
 
-    // --- VERIFICA SE TEVE CONVERSA ---
+    // Verifica conversa
     const segundosFalados = converterTempoParaSegundos(callData.speaking_time);
     const teveConversa = segundosFalados > 0;
 
@@ -113,7 +115,7 @@ async function enviarParaHubspot(callData) {
     const phone = rawPhone.toString().replace(/\D/g, ''); 
     if (!phone) return;
 
-    // Lógica do Nome (Apenas Firstname)
+    // Lógica do Nome (Só Firstname)
     let nomeCompleto = null;
     let isNomeGenerico = true;
 
@@ -135,29 +137,39 @@ async function enviarParaHubspot(callData) {
         nomeCompleto = "Lead 3C";
     }
 
-    // Data Formatada
     const dataFormatada = formatarDataParaHubspot(callData.call_date_rfc3339);
 
     try {
-        // Busca Contato no HubSpot
-        const buscaHubspot = await axios.post(
-            'https://api.hubapi.com/crm/v3/objects/contacts/search',
-            { filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: phone }] }] },
-            { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
-        );
+        let contactId = null;
 
-        // --- LÓGICA DE ATUALIZAÇÃO ---
-        if (buscaHubspot.data.total > 0) {
-            // >>> CLIENTE JÁ EXISTE <<<
-            const contactId = buscaHubspot.data.results[0].id;
+        // PASSO A: Verifica Memória Local (Evita duplicidade em batch)
+        if (cacheIdsRecentes.has(phone)) {
+            contactId = cacheIdsRecentes.get(phone);
+            // console.log(`🧠 Encontrado em cache local: ${phone} -> ID ${contactId}`);
+        } 
+        
+        // PASSO B: Se não achou na memória, busca na API do HubSpot
+        if (!contactId) {
+            const buscaHubspot = await axios.post(
+                'https://api.hubapi.com/crm/v3/objects/contacts/search',
+                { filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: phone }] }] },
+                { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+            );
 
+            if (buscaHubspot.data.total > 0) {
+                contactId = buscaHubspot.data.results[0].id;
+                // Salva no cache para a próxima iteração
+                cacheIdsRecentes.set(phone, contactId);
+            }
+        }
+
+        // --- LÓGICA DE DECISÃO ---
+
+        if (contactId) {
+            // >>> UPDATE (Cliente Já Existe) <<<
+            
             if (teveConversa) {
-                // ===============================================
-                // CENÁRIO 1: Cliente Existe + Atendeu (Conversa)
-                // ===============================================
-                // Atualiza tudo (Status, Gravação, etc)
-
-                // Define Status
+                // ATUALIZAÇÃO COMPLETA
                 let statusFinal = "Sem tabulação";
                 if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
                     statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
@@ -174,8 +186,7 @@ async function enviarParaHubspot(callData) {
                     ultimo_contato_feito_em: dataFormatada
                 };
 
-                // Só atualiza o nome se não for genérico ("Lead 3C")
-                // E usamos apenas firstname conforme solicitado
+                // Atualiza nome apenas se tivermos um nome real (não genérico)
                 if (!isNomeGenerico) {
                     propsAtualizacao.firstname = nomeCompleto;
                 }
@@ -185,35 +196,26 @@ async function enviarParaHubspot(callData) {
                     { properties: propsAtualizacao },
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
-                console.log(`💾 [ATENDIDA] Cliente Atualizado: ${phone} | Status: ${statusFinal}`);
+                console.log(`💾 [ATENDIDA] Atualizado: ${phone} | ${statusFinal}`);
 
             } else {
-                // ========================================================
-                // CENÁRIO 2: Cliente Existe + NÃO Atendeu (Sem Conversa)
-                // ========================================================
-                // Atualiza APENAS o campo "ultimo_contato_sem_sucesso"
-
+                // ATUALIZAÇÃO PARCIAL (Sem Sucesso)
                 const propsSemSucesso = {
                     ultimo_contato_sem_sucesso: dataFormatada
                 };
-
                 await axios.patch(
                     `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
                     { properties: propsSemSucesso },
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
-                console.log(`⚠️ [NÃO ATENDIDA] Cliente Existe (${phone}). Atualizado campo 'ultimo_contato_sem_sucesso'.`);
+                console.log(`⚠️ [NÃO ATENDIDA] Atualizado 'sem sucesso': ${phone}`);
             }
 
         } else {
-            // >>> CLIENTE NÃO EXISTE <<<
+            // >>> CREATE (Novo Cliente) <<<
             
+            // TRAVA DE SEGURANÇA: Só cria se teve conversa!
             if (teveConversa) {
-                // ===============================================
-                // CENÁRIO 3: Novo Cliente + Atendeu
-                // ===============================================
-                // Cria o contato completo
-
                 let statusFinal = "Sem tabulação";
                 if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
                     statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
@@ -225,31 +227,35 @@ async function enviarParaHubspot(callData) {
 
                 const propsCriacao = {
                     phone: phone,
-                    firstname: nomeCompleto, // Nome completo vai aqui
-                    // lastname: removido propositalmente
+                    firstname: nomeCompleto, // Apenas firstname
                     status_ultima_ligacao: statusFinal,
                     ultima_gravacao_3c: linkAudio,
                     lead_contatado_: "true",
                     ultimo_contato_feito_em: dataFormatada
                 };
-                
-                await axios.post(
+
+                const createRes = await axios.post(
                     'https://api.hubapi.com/crm/v3/objects/contacts',
                     { properties: propsCriacao },
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
-                console.log(`✨ [NOVO] Cliente Criado: ${nomeCompleto} | Status: ${statusFinal}`);
+
+                // IMPORTANTE: Salva o ID do novo cliente no cache imediatamente!
+                // Se a próxima chamada no loop for dele, o código vai cair no "if (contactId)" acima
+                const newId = createRes.data.id;
+                cacheIdsRecentes.set(phone, newId);
+
+                console.log(`✨ [NOVO] Criado: ${nomeCompleto} | ID: ${newId}`);
 
             } else {
-                // ===============================================
-                // CENÁRIO 4: Novo Cliente + NÃO Atendeu
-                // ===============================================
-                // IGNORAR. Não criamos contato novo se não houve conversa.
-                // console.log(`⏩ Ignorado (0s e não existe no HubSpot): ${phone}`);
+                // Não atendeu e não existe no HubSpot? IGNORE.
+                // console.log(`⏩ Ignorado (Novo + Sem Conversa): ${phone}`);
             }
         }
+
     } catch (err) {
         console.error('❌ Erro HubSpot:', err.message);
+        if(err.response) console.error(JSON.stringify(err.response.data, null, 2));
     }
 }
 
