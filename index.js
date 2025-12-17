@@ -11,11 +11,7 @@ const TOKEN_3C = process.env.TOKEN_3C;
 
 const INTERVALO_BUSCA = 60000; 
 const chamadasProcessadas = new Set();
-
-// --- NOVIDADE: CACHE ANTI-DUPLICIDADE ---
-// Guarda os IDs criados nesta sessão para evitar criar duplicado 
-// enquanto o HubSpot ainda está indexando.
-const cacheIdsRecentes = new Map(); // Chave: Telefone -> Valor: ContactId
+const cacheIdsRecentes = new Map();
 
 // Ignora erro SSL
 const agent = new https.Agent({  
@@ -23,7 +19,7 @@ const agent = new https.Agent({
 });
 
 console.log('------------------------------------------------');
-console.log('🤖 ROBÔ 3C RODANDO (Polling V7 - Anti-Duplicidade)');
+console.log('🤖 ROBÔ 3C RODANDO (Polling V8 - Regra Caixa Postal)');
 console.log(`🕒 Verificando a cada ${INTERVALO_BUSCA / 1000} segundos...`);
 console.log('------------------------------------------------');
 
@@ -106,16 +102,30 @@ async function buscarNovasChamadas() {
 async function enviarParaHubspot(callData) {
     const callId = callData.id || callData._id;
 
-    // Verifica conversa
-    const segundosFalados = converterTempoParaSegundos(callData.speaking_time);
-    const teveConversa = segundosFalados > 0;
+    // --- 1. DETERMINA O STATUS PRIMEIRO ---
+    let statusFinal = "Sem tabulação";
+    if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
+        statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
+    } else if (callData.readable_status_text && callData.readable_status_text !== "-") {
+        statusFinal = callData.readable_status_text;
+    }
 
-    // 1. Dados do Cliente
+    // --- 2. REGRA DE NEGÓCIO: CAIXA POSTAL ---
+    // Verifica se o status é exatamente aquele que você quer ignorar
+    const ehCaixaPostal = (statusFinal === "Caixa postal pós atendimento" || statusFinal === "Caixa Postal");
+
+    // Verifica se tecnicamente houve áudio
+    const segundosFalados = converterTempoParaSegundos(callData.speaking_time);
+    
+    // DECISÃO FINAL: Consideramos "Atendida com Sucesso" apenas se:
+    // Tiver tempo falado E NÃO FOR caixa postal
+    const sucessoNaLigacao = (segundosFalados > 0) && !ehCaixaPostal;
+
+    // --- 3. DADOS DO CLIENTE ---
     const rawPhone = callData.number || "";
     const phone = rawPhone.toString().replace(/\D/g, ''); 
     if (!phone) return;
 
-    // Lógica do Nome (Só Firstname)
     let nomeCompleto = null;
     let isNomeGenerico = true;
 
@@ -142,13 +152,12 @@ async function enviarParaHubspot(callData) {
     try {
         let contactId = null;
 
-        // PASSO A: Verifica Memória Local (Evita duplicidade em batch)
+        // Cache Local
         if (cacheIdsRecentes.has(phone)) {
             contactId = cacheIdsRecentes.get(phone);
-            // console.log(`🧠 Encontrado em cache local: ${phone} -> ID ${contactId}`);
         } 
         
-        // PASSO B: Se não achou na memória, busca na API do HubSpot
+        // Busca HubSpot
         if (!contactId) {
             const buscaHubspot = await axios.post(
                 'https://api.hubapi.com/crm/v3/objects/contacts/search',
@@ -158,25 +167,18 @@ async function enviarParaHubspot(callData) {
 
             if (buscaHubspot.data.total > 0) {
                 contactId = buscaHubspot.data.results[0].id;
-                // Salva no cache para a próxima iteração
                 cacheIdsRecentes.set(phone, contactId);
             }
         }
 
-        // --- LÓGICA DE DECISÃO ---
+        // --- LÓGICA DE AÇÃO ---
 
         if (contactId) {
-            // >>> UPDATE (Cliente Já Existe) <<<
+            // >>> CLIENTE JÁ EXISTE <<<
             
-            if (teveConversa) {
-                // ATUALIZAÇÃO COMPLETA
-                let statusFinal = "Sem tabulação";
-                if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
-                    statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
-                } else if (callData.readable_status_text && callData.readable_status_text !== "-") {
-                    statusFinal = callData.readable_status_text;
-                }
-
+            if (sucessoNaLigacao) {
+                // SUCESSO REAL (Conversa + Status Válido)
+                // Atualiza tudo
                 const linkAudio = `https://3c.fluxoti.com/api/v1/calls/${callId}/recording?api_token=${TOKEN_3C}`;
 
                 const propsAtualizacao = {
@@ -186,7 +188,6 @@ async function enviarParaHubspot(callData) {
                     ultimo_contato_feito_em: dataFormatada
                 };
 
-                // Atualiza nome apenas se tivermos um nome real (não genérico)
                 if (!isNomeGenerico) {
                     propsAtualizacao.firstname = nomeCompleto;
                 }
@@ -199,7 +200,8 @@ async function enviarParaHubspot(callData) {
                 console.log(`💾 [ATENDIDA] Atualizado: ${phone} | ${statusFinal}`);
 
             } else {
-                // ATUALIZAÇÃO PARCIAL (Sem Sucesso)
+                // FALHA OU CAIXA POSTAL
+                // Atualiza apenas 'sem sucesso', preservando o status anterior
                 const propsSemSucesso = {
                     ultimo_contato_sem_sucesso: dataFormatada
                 };
@@ -208,26 +210,24 @@ async function enviarParaHubspot(callData) {
                     { properties: propsSemSucesso },
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
-                console.log(`⚠️ [NÃO ATENDIDA] Atualizado 'sem sucesso': ${phone}`);
+                
+                if (ehCaixaPostal) {
+                    console.log(`⚠️ [CAIXA POSTAL] Tratado como 'sem sucesso': ${phone} (Status não alterado)`);
+                } else {
+                    console.log(`⚠️ [NÃO ATENDIDA] Atualizado 'sem sucesso': ${phone}`);
+                }
             }
 
         } else {
-            // >>> CREATE (Novo Cliente) <<<
+            // >>> NOVO CLIENTE <<<
             
-            // TRAVA DE SEGURANÇA: Só cria se teve conversa!
-            if (teveConversa) {
-                let statusFinal = "Sem tabulação";
-                if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
-                    statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
-                } else if (callData.readable_status_text && callData.readable_status_text !== "-") {
-                    statusFinal = callData.readable_status_text;
-                }
-
+            // Só cria se for sucesso REAL (Conversa + Não é caixa postal)
+            if (sucessoNaLigacao) {
                 const linkAudio = `https://3c.fluxoti.com/api/v1/calls/${callId}/recording?api_token=${TOKEN_3C}`;
 
                 const propsCriacao = {
                     phone: phone,
-                    firstname: nomeCompleto, // Apenas firstname
+                    firstname: nomeCompleto,
                     status_ultima_ligacao: statusFinal,
                     ultima_gravacao_3c: linkAudio,
                     lead_contatado_: "true",
@@ -240,16 +240,13 @@ async function enviarParaHubspot(callData) {
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
 
-                // IMPORTANTE: Salva o ID do novo cliente no cache imediatamente!
-                // Se a próxima chamada no loop for dele, o código vai cair no "if (contactId)" acima
                 const newId = createRes.data.id;
                 cacheIdsRecentes.set(phone, newId);
-
-                console.log(`✨ [NOVO] Criado: ${nomeCompleto} | ID: ${newId}`);
+                console.log(`✨ [NOVO] Criado: ${nomeCompleto} | Status: ${statusFinal}`);
 
             } else {
-                // Não atendeu e não existe no HubSpot? IGNORE.
-                // console.log(`⏩ Ignorado (Novo + Sem Conversa): ${phone}`);
+                // Se for novo E for caixa postal (ou não atendida), ignoramos para não sujar o banco
+                // console.log(`⏩ Ignorado (Novo + Sem Sucesso/Caixa Postal): ${phone}`);
             }
         }
 
