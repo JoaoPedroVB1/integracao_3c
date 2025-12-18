@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "build:win": "pkg index.js --targets node18-win-x64 --output dist/integracao-3c.exe",
+    "set-icon:win": "node scripts/set-icon-win.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -14,5 +17,14 @@
     "body-parser": "^2.2.1",
     "dotenv": "^17.2.3",
     "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1",
+    "rcedit": "^4.0.1"
+  },
+  "pkg": {
+    "scripts": [
+      "node_modules/axios/dist/node/axios.cjs"
+    ]
   }
 }

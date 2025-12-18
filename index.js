@@ -19,7 +19,7 @@ const agent = new https.Agent({
 });
 
 console.log('------------------------------------------------');
-console.log('🤖 ROBÔ 3C RODANDO (Polling V8 - Regra Caixa Postal)');
+console.log('🤖 ROBÔ 3C RODANDO (Polling V10 - Registro Total)');
 console.log(`🕒 Verificando a cada ${INTERVALO_BUSCA / 1000} segundos...`);
 console.log('------------------------------------------------');
 
@@ -46,6 +46,38 @@ function formatarDataParaHubspot(dataRFC3339) {
         day: '2-digit', month: '2-digit', year: 'numeric',
         hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
+}
+
+// DETETIVE DE NOMES
+function descobrirNome(mailingData) {
+    if (!mailingData || !mailingData.data) return null;
+
+    let dados = mailingData.data;
+
+    if (Array.isArray(dados)) {
+        if (dados.length === 0) return null;
+        dados = dados[0];
+    }
+
+    if (dados.Nome) return dados.Nome;
+    if (dados.name) return dados.name;
+    if (dados.Name) return dados.Name;
+    if (dados.nome) return dados.nome;
+
+    if (typeof dados === 'object') {
+        const chaves = Object.keys(dados);
+        const chaveNome = chaves.find(k => {
+            const key = k.toLowerCase();
+            return key.includes('nome') || 
+                   key.includes('name') || 
+                   key.includes('cliente') || 
+                   key.includes('customer');
+        });
+        
+        if (chaveNome) return dados[chaveNome];
+    }
+
+    return null;
 }
 
 async function buscarNovasChamadas() {
@@ -102,7 +134,7 @@ async function buscarNovasChamadas() {
 async function enviarParaHubspot(callData) {
     const callId = callData.id || callData._id;
 
-    // --- 1. DETERMINA O STATUS PRIMEIRO ---
+    // --- 1. STATUS ---
     let statusFinal = "Sem tabulação";
     if (callData.qualification && callData.qualification !== "-" && callData.qualification !== "") {
         statusFinal = (typeof callData.qualification === 'object') ? callData.qualification.name : callData.qualification;
@@ -110,15 +142,9 @@ async function enviarParaHubspot(callData) {
         statusFinal = callData.readable_status_text;
     }
 
-    // --- 2. REGRA DE NEGÓCIO: CAIXA POSTAL ---
-    // Verifica se o status é exatamente aquele que você quer ignorar
+    // --- 2. REGRA CAIXA POSTAL ---
     const ehCaixaPostal = (statusFinal === "Caixa postal pós atendimento" || statusFinal === "Caixa Postal");
-
-    // Verifica se tecnicamente houve áudio
     const segundosFalados = converterTempoParaSegundos(callData.speaking_time);
-    
-    // DECISÃO FINAL: Consideramos "Atendida com Sucesso" apenas se:
-    // Tiver tempo falado E NÃO FOR caixa postal
     const sucessoNaLigacao = (segundosFalados > 0) && !ehCaixaPostal;
 
     // --- 3. DADOS DO CLIENTE ---
@@ -126,26 +152,21 @@ async function enviarParaHubspot(callData) {
     const phone = rawPhone.toString().replace(/\D/g, ''); 
     if (!phone) return;
 
+    // --- 4. EXTRAÇÃO DE NOME ---
+    const nomeEncontrado = descobrirNome(callData.mailing_data);
+    
     let nomeCompleto = null;
     let isNomeGenerico = true;
 
-    if (callData.mailing_data) {
-        let dadosMailing = null;
-        if (Array.isArray(callData.mailing_data.data) && callData.mailing_data.data.length > 0) {
-            dadosMailing = callData.mailing_data.data[0];
-        } else if (callData.mailing_data.data && !Array.isArray(callData.mailing_data.data)) {
-            dadosMailing = callData.mailing_data.data;
-        }
-
-        if (dadosMailing && (dadosMailing.Nome || dadosMailing.name)) {
-            nomeCompleto = dadosMailing.Nome || dadosMailing.name;
-            isNomeGenerico = false;
-        }
-    }
-
-    if (!nomeCompleto) {
+    if (nomeEncontrado && nomeEncontrado.trim() !== "" && nomeEncontrado !== "-") {
+        nomeCompleto = nomeEncontrado;
+        isNomeGenerico = false;
+    } else {
         nomeCompleto = "Lead 3C";
+        isNomeGenerico = true;
     }
+
+    console.log(`🕵️ [DEBUG] Tel: ${phone} | Nome Final: "${nomeCompleto}"`);
 
     const dataFormatada = formatarDataParaHubspot(callData.call_date_rfc3339);
 
@@ -171,14 +192,13 @@ async function enviarParaHubspot(callData) {
             }
         }
 
-        // --- LÓGICA DE AÇÃO ---
+        // --- AÇÃO NO HUBSPOT ---
 
         if (contactId) {
-            // >>> CLIENTE JÁ EXISTE <<<
+            // >>> ATUALIZAÇÃO (Cliente Já Existe) <<<
             
             if (sucessoNaLigacao) {
-                // SUCESSO REAL (Conversa + Status Válido)
-                // Atualiza tudo
+                // SUCESSO: Atualiza tudo
                 const linkAudio = `https://3c.fluxoti.com/api/v1/calls/${callId}/recording?api_token=${TOKEN_3C}`;
 
                 const propsAtualizacao = {
@@ -200,8 +220,7 @@ async function enviarParaHubspot(callData) {
                 console.log(`💾 [ATENDIDA] Atualizado: ${phone} | ${statusFinal}`);
 
             } else {
-                // FALHA OU CAIXA POSTAL
-                // Atualiza apenas 'sem sucesso', preservando o status anterior
+                // FALHA: Atualiza só o campo de falha
                 const propsSemSucesso = {
                     ultimo_contato_sem_sucesso: dataFormatada
                 };
@@ -212,17 +231,19 @@ async function enviarParaHubspot(callData) {
                 );
                 
                 if (ehCaixaPostal) {
-                    console.log(`⚠️ [CAIXA POSTAL] Tratado como 'sem sucesso': ${phone} (Status não alterado)`);
+                    console.log(`⚠️ [CAIXA POSTAL] 'sem sucesso' atualizado: ${phone}`);
                 } else {
-                    console.log(`⚠️ [NÃO ATENDIDA] Atualizado 'sem sucesso': ${phone}`);
+                    console.log(`⚠️ [NÃO ATENDIDA] 'sem sucesso' atualizado: ${phone}`);
                 }
             }
 
         } else {
-            // >>> NOVO CLIENTE <<<
+            // >>> CRIAÇÃO (Novo Cliente) <<<
             
-            // Só cria se for sucesso REAL (Conversa + Não é caixa postal)
             if (sucessoNaLigacao) {
+                // ==========================
+                // NOVO + ATENDEU (SUCESSO)
+                // ==========================
                 const linkAudio = `https://3c.fluxoti.com/api/v1/calls/${callId}/recording?api_token=${TOKEN_3C}`;
 
                 const propsCriacao = {
@@ -240,13 +261,39 @@ async function enviarParaHubspot(callData) {
                     { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
                 );
 
-                const newId = createRes.data.id;
-                cacheIdsRecentes.set(phone, newId);
-                console.log(`✨ [NOVO] Criado: ${nomeCompleto} | Status: ${statusFinal}`);
+                cacheIdsRecentes.set(phone, createRes.data.id);
+                console.log(`✨ [NOVO] Criado (Sucesso): ${nomeCompleto}`);
 
             } else {
-                // Se for novo E for caixa postal (ou não atendida), ignoramos para não sujar o banco
-                // console.log(`⏩ Ignorado (Novo + Sem Sucesso/Caixa Postal): ${phone}`);
+                // ==================================
+                // NOVO + NÃO ATENDEU (SEM SUCESSO)
+                // ==================================
+                // Cria com campos "Não atendida" conforme solicitado
+                
+                const propsCriacaoSemSucesso = {
+                    phone: phone,
+                    firstname: nomeCompleto,
+                    
+                    // Campos solicitados:
+                    status_ultima_ligacao: "Sem sucesso",
+                    ultima_gravacao_3c: "Não atendida",
+                    ultimo_contato_feito_em: "Não atendida",
+                    
+                    // Data real da falha:
+                    ultimo_contato_sem_sucesso: dataFormatada,
+                    
+                    // Opcional: define false pois não houve contato efetivo
+                    lead_contatado_: "false" 
+                };
+
+                const createRes = await axios.post(
+                    'https://api.hubapi.com/crm/v3/objects/contacts',
+                    { properties: propsCriacaoSemSucesso },
+                    { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+                );
+
+                cacheIdsRecentes.set(phone, createRes.data.id);
+                console.log(`🌑 [NOVO] Criado (Sem Sucesso): ${nomeCompleto}`);
             }
         }
 
