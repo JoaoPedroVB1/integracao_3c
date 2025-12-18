@@ -9,17 +9,23 @@ const PORT = 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const TOKEN_3C = process.env.TOKEN_3C;
 
-const INTERVALO_BUSCA = 60000; // 60 segundos entre ciclos
+const INTERVALO_BUSCA = 60000; // 60 segundos
+const ITENS_POR_PAGINA = 500;  // Aumentado para 500 para reduzir requisições
 
 // Memória de execução
 const chamadasProcessadas = new Set(); 
 const cacheIdsRecentes = new Map();    
-let isProcessing = false; // Trava de segurança
+let isProcessing = false; 
 
-const agent = new https.Agent({ rejectUnauthorized: false });
+// Configuração do Axios com Timeout maior para aguentar cargas pesadas
+const axiosInstance = axios.create({
+    timeout: 30000, // 30 segundos de timeout
+    httpsAgent: new https.Agent({ rejectUnauthorized: false })
+});
 
 console.log('------------------------------------------------');
-console.log('🤖 ROBÔ 3C RODANDO (V13 - Limpeza HTML)');
+console.log('🤖 ROBÔ 3C RODANDO (V16 - High Performance)');
+console.log(`🚀 Lote por página: ${ITENS_POR_PAGINA} registros`);
 console.log('------------------------------------------------');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -51,39 +57,25 @@ function formatarDataBrasileira(dataRFC3339) {
     return `${dia}/${mes}/${ano} ${horas}:${minutos}:${segundos}`;
 }
 
-// --- NOVA FUNÇÃO: FAXINA DE HTML ---
 function limparTextoHTML(texto) {
     if (!texto) return null;
     let limpo = texto.toString();
-
-    // 1. Remove tags HTML completas (<span...>, </span>, <br/>, etc)
     limpo = limpo.replace(/<[^>]*>?/gm, '');
-
-    // 2. Substitui entidades comuns (ex: &nbsp; vira espaço)
     limpo = limpo.replace(/&nbsp;/gi, ' ');
     limpo = limpo.replace(/&amp;/gi, '&');
-
-    // 3. Remove aspas extras nas pontas
     limpo = limpo.replace(/^["']+|["']+$/g, '');
-
-    // 4. Remove espaços duplos/triplos e espaços nas pontas
     limpo = limpo.replace(/\s+/g, ' ').trim();
-
     return limpo;
 }
 
 function descobrirNome(mailingData) {
     if (!mailingData || !mailingData.data) return null;
     let dados = mailingData.data;
-    
     if (Array.isArray(dados)) {
         if (dados.length === 0) return null;
         dados = dados[0];
     }
-
     let nomeBruto = null;
-
-    // Busca o valor bruto
     if (dados.Nome) nomeBruto = dados.Nome;
     else if (dados.name) nomeBruto = dados.name;
     else if (dados.Name) nomeBruto = dados.Name;
@@ -96,72 +88,115 @@ function descobrirNome(mailingData) {
         });
         if (chaveNome) nomeBruto = dados[chaveNome];
     }
-
-    // Aplica a Faxina antes de devolver
     return limparTextoHTML(nomeBruto);
 }
 
 // --- CICLO PRINCIPAL ---
 async function cicloPrincipal() {
-    if (isProcessing) {
-        console.log('⚠️ Ciclo anterior ainda rodando. Aguardando...');
-        return;
-    }
+    if (isProcessing) { return; }
     isProcessing = true;
     
     try {
-        await buscarNovasChamadas();
+        await processarCicloCompleto();
     } catch (error) {
         console.error('❌ Erro fatal:', error.message);
     } finally {
         isProcessing = false;
-        console.log(`💤 Aguardando próximo ciclo...`);
+        console.log(`💤 Ciclo concluído. Aguardando próximo...`);
         setTimeout(cicloPrincipal, INTERVALO_BUSCA);
     }
 }
 
-async function buscarNovasChamadas() {
+async function processarCicloCompleto() {
     const dataHoje = getDataHojeFormatada();
-    console.log(`\n🕒 Iniciando busca... (${new Date().toLocaleTimeString()})`);
+    console.log(`\n📅 DATA: ${dataHoje} | 🕒 Hora: ${new Date().toLocaleTimeString()}`);
     
-    const params = {
-        api_token: TOKEN_3C,
-        start_date: `${dataHoje} 00:00:00`,
-        end_date: `${dataHoje} 23:59:59`,
-        per_page: 100,
-        with_mailing: true 
-    };
+    let offset = 0;
+    let continuarBuscando = true;
+    
+    // USAMOS UM MAP PARA REMOVER DUPLICATAS AUTOMATICAMENTE
+    // Se a API mandar o ID 123 na pagina 1 e de novo na pagina 2, o Map só guarda uma vez.
+    const mapaChamadasDoDia = new Map();
 
-    const url3c = `https://3c.fluxoti.com/api/v1/calls`;
-    const response = await axios.get(url3c, { params, httpsAgent: agent });
-    let listaChamadas = response.data.data || response.data;
+    // 1. DOWNLOAD (BUFFERIZAÇÃO)
+    console.log(`⬇️ Baixando dados do 3C (Lotes de ${ITENS_POR_PAGINA})...`);
 
-    if (!Array.isArray(listaChamadas)) return;
+    while (continuarBuscando) {
+        try {
+            const params = {
+                api_token: TOKEN_3C,
+                start_date: `${dataHoje} 00:00:00`,
+                end_date: `${dataHoje} 23:59:59`,
+                per_page: ITENS_POR_PAGINA,
+                offset: offset,
+                with_mailing: true 
+            };
 
-    let novasChamadas = listaChamadas.filter(call => {
-        const id = call.id || call._id;
-        if (chamadasProcessadas.has(id)) return false;
-        return true;
+            const url3c = `https://3c.fluxoti.com/api/v1/calls`;
+            const response = await axiosInstance.get(url3c, { params });
+            const listaParcial = response.data.data || response.data;
+
+            if (!Array.isArray(listaParcial) || listaParcial.length === 0) {
+                continuarBuscando = false;
+                break;
+            }
+
+            // Guarda no Map (Deduplicação instantânea)
+            for (const call of listaParcial) {
+                const id = call.id || call._id;
+                // Só adiciona se a gente NUNCA processou esse ID na vida do robô
+                if (!chamadasProcessadas.has(id)) {
+                    mapaChamadasDoDia.set(id, call);
+                }
+            }
+
+            process.stdout.write(`   📦 Baixados: ${mapaChamadasDoDia.size} novos registros acumulados... (Offset ${offset})\r`);
+
+            if (listaParcial.length < ITENS_POR_PAGINA) {
+                continuarBuscando = false;
+            } else {
+                offset += ITENS_POR_PAGINA;
+            }
+
+        } catch (error) {
+            console.error(`\n❌ Erro no download (Offset ${offset}):`, error.message);
+            // Se der erro de rede, paramos o download deste ciclo e processamos o que já temos
+            continuarBuscando = false;
+        }
+    }
+
+    // 2. PREPARAÇÃO
+    // Converte Map para Array
+    const listaFinal = Array.from(mapaChamadasDoDia.values());
+
+    if (listaFinal.length === 0) {
+        console.log('\n✅ Nenhuma chamada nova encontrada.');
+        return;
+    }
+
+    console.log(`\n🔍 Processando ${listaFinal.length} chamadas únicas.`);
+    console.log(`🔄 Ordenando cronologicamente (Antigo -> Novo)...`);
+
+    // ORDENAÇÃO: Garante que a última chamada do dia seja a última a ser processada
+    listaFinal.sort((a, b) => {
+        const dataA = new Date(a.call_date_rfc3339 || a.created_at);
+        const dataB = new Date(b.call_date_rfc3339 || b.created_at);
+        return dataA - dataB;
     });
 
-    if (novasChamadas.length > 0) {
-        console.log(`🔎 Encontrei ${novasChamadas.length} novas ocorrências.`);
+    // 3. ENVIO SEQUENCIAL
+    console.log(`🚀 Enviando para o HubSpot...`);
 
-        // Ordena: Antiga -> Recente
-        novasChamadas.sort((a, b) => {
-            const dataA = new Date(a.call_date_rfc3339 || a.created_at);
-            const dataB = new Date(b.call_date_rfc3339 || b.created_at);
-            return dataA - dataB;
-        });
-
-        for (const call of novasChamadas) {
-            const id = call.id || call._id;
-            chamadasProcessadas.add(id);
-            await enviarParaHubspot(call);
-            await sleep(1000); 
-        }
-    } else {
-        console.log('✅ Nenhuma chamada nova.');
+    for (const call of listaFinal) {
+        const id = call.id || call._id;
+        
+        // Marca como processada ANTES de enviar para evitar loops se der erro
+        chamadasProcessadas.add(id);
+        
+        await enviarParaHubspot(call);
+        
+        // Pausa pequena para não travar o server
+        await sleep(2000); 
     }
 }
 
@@ -186,7 +221,7 @@ async function enviarParaHubspot(callData) {
     const phone = rawPhone.toString().replace(/\D/g, ''); 
     if (!phone) return;
 
-    // 4. Nome (Já vem limpo do HTML)
+    // 4. Nome
     const nomeEncontrado = descobrirNome(callData.mailing_data);
     let nomeCompleto = null;
     let isNomeGenerico = true;
@@ -199,7 +234,7 @@ async function enviarParaHubspot(callData) {
         isNomeGenerico = true;
     }
 
-    console.log(`🕵️ [DEBUG] Tel: ${phone} | Nome Limpo: "${nomeCompleto}"`);
+    console.log(`🕵️ [DEBUG] Tel: ${phone} | Nome: "${nomeCompleto}"`);
 
     const dataFormatada = formatarDataBrasileira(callData.call_date_rfc3339);
 
@@ -211,7 +246,7 @@ async function enviarParaHubspot(callData) {
         } 
         
         if (!contactId) {
-            const buscaHubspot = await axios.post(
+            const buscaHubspot = await axiosInstance.post(
                 'https://api.hubapi.com/crm/v3/objects/contacts/search',
                 { filterGroups: [{ filters: [{ propertyName: 'phone', operator: 'CONTAINS_TOKEN', value: phone }] }] },
                 { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
@@ -235,16 +270,16 @@ async function enviarParaHubspot(callData) {
                 };
                 if (!isNomeGenerico) props.firstname = nomeCompleto;
 
-                await axios.patch(`https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`, { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+                await axiosInstance.patch(`https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`, { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
                 console.log(`💾 [ATUALIZADO] ${phone} | ${statusFinal}`);
             } else {
                 const props = { ultimo_contato_sem_sucesso: dataFormatada };
-                await axios.patch(`https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`, { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+                await axiosInstance.patch(`https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`, { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
                 console.log(`⚠️ [SEM SUCESSO] ${phone} | Data atualizada`);
             }
         } else {
             // >>> CREATE
-            if (cacheIdsRecentes.has(phone)) return; 
+            if (cacheIdsRecentes.has(phone)) return;
 
             if (sucessoNaLigacao) {
                 const linkAudio = `https://3c.fluxoti.com/api/v1/calls/${callId}/recording?api_token=${TOKEN_3C}`;
@@ -256,7 +291,7 @@ async function enviarParaHubspot(callData) {
                     lead_contatado_: "true",
                     ultimo_contato_feito_em: dataFormatada
                 };
-                const res = await axios.post('https://api.hubapi.com/crm/v3/objects/contacts', { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+                const res = await axiosInstance.post('https://api.hubapi.com/crm/v3/objects/contacts', { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
                 cacheIdsRecentes.set(phone, res.data.id);
                 console.log(`✨ [CRIADO - SUCESSO] ${nomeCompleto}`);
             } else {
@@ -269,7 +304,7 @@ async function enviarParaHubspot(callData) {
                     ultimo_contato_sem_sucesso: dataFormatada,
                     lead_contatado_: "false" 
                 };
-                const res = await axios.post('https://api.hubapi.com/crm/v3/objects/contacts', { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
+                const res = await axiosInstance.post('https://api.hubapi.com/crm/v3/objects/contacts', { properties: props }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } });
                 cacheIdsRecentes.set(phone, res.data.id);
                 console.log(`🌑 [CRIADO - SEM SUCESSO] ${nomeCompleto}`);
             }
