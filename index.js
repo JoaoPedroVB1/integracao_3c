@@ -26,6 +26,8 @@ const axiosInstance = axios.create({
 console.log('------------------------------------------------');
 console.log('🤖 ROBÔ 3C RODANDO (V16 - High Performance)');
 console.log(`🚀 Lote por página: ${ITENS_POR_PAGINA} registros`);
+console.log(`🔐 HUBSPOT_TOKEN set: ${Boolean(HUBSPOT_TOKEN)}`);
+console.log(`🔐 TOKEN_3C set: ${Boolean(TOKEN_3C)}`);
 console.log('------------------------------------------------');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
