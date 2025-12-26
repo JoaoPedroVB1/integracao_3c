@@ -5,7 +5,7 @@ const https = require('https');
 const app = express();
 
 // --- CONFIGURAÇÕES ---
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const TOKEN_3C = process.env.TOKEN_3C;
 
@@ -315,6 +315,10 @@ async function enviarParaHubspot(callData) {
     }
 }
 
+app.get('/health', (req, res) => {
+    res.status(200).send('ok');
+});
+
 cicloPrincipal();
 
-app.listen(PORT, () => console.log(`🚀 Integração Rodando.`));
+app.listen(PORT, () => console.log(`🚀 Integração Rodando na porta ${PORT}.`));
